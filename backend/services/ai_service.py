@@ -5,16 +5,16 @@ Loads a pre-trained scikit-learn model and uses it to predict the
 risk level of a given endpoint based on extracted features.
 
 Risk levels (model output labels):
-    0 → "Low"
-    1 → "Medium"
-    2 → "High"
-    3 → "Critical"
+    Low | Medium | High | Critical
 
-If no trained model file exists yet, the service falls back to a
-simple rule-based heuristic so the rest of the pipeline still works
-during development / demos.
+Changes from original:
+    - Model loads at MODULE IMPORT TIME (startup) not on first request
+    - Both pipeline and label encoder loaded together
+    - gc.collect() called after predictions to free memory
+    - Robust path resolution that works both locally and on Render
 """
 
+import gc
 import logging
 import os
 from typing import Dict, Any
@@ -22,43 +22,83 @@ from typing import Dict, Any
 import joblib
 import numpy as np
 
-from config import config
-
 logger = logging.getLogger(__name__)
 
-# Module-level cache — we load the model once and reuse it
-_model = None
+# ── Resolve model paths ───────────────────────────────────────────────────────
+# Works in all environments:
+#   Local:  backend/ → ../model/saved_models/
+#   Render: /opt/render/project/src/backend/ → ../model/saved_models/
 
-
-def _load_model():
+def _resolve_model_path() -> str:
     """
-    Load the serialised ML model from disk (lazy, cached).
-    Returns the model object, or None if the file doesn't exist yet.
+    Find the model file by checking multiple possible locations.
+    Returns the first valid path found.
     """
-    global _model
+    # 1. Check environment variable first (set in .env or Render dashboard)
+    env_path = os.getenv("MODEL_PATH", "")
+    if env_path and os.path.exists(env_path):
+        return env_path
 
-    if _model is not None:
-        return _model  # Already loaded
+    # 2. Relative path from backend/ folder
+    here = os.path.dirname(os.path.abspath(__file__))
+    backend_dir = os.path.dirname(here)  # services/ → backend/
 
-    if os.path.exists(config.MODEL_PATH):
-        try:
-            _model = joblib.load(config.MODEL_PATH)
-            logger.info("ML model loaded from %s", config.MODEL_PATH)
-        except Exception as exc:
-            logger.error("Failed to load model: %s", exc)
-            _model = None
+    candidates = [
+        os.path.join(backend_dir, "..", "model", "saved_models", "vulnerability_risk_model.pkl"),
+        os.path.join(backend_dir, "model", "saved_models", "vulnerability_risk_model.pkl"),
+        os.path.join(backend_dir, "saved_models", "vulnerability_risk_model.pkl"),
+        # Render absolute path fallback
+        "/opt/render/project/src/model/saved_models/vulnerability_risk_model.pkl",
+    ]
+
+    for path in candidates:
+        normalised = os.path.normpath(path)
+        if os.path.exists(normalised):
+            return normalised
+
+    # Return the default even if it doesn't exist — caller handles missing file
+    return os.path.normpath(candidates[0])
+
+
+def _resolve_encoder_path(model_path: str) -> str:
+    """Derive the label encoder path from the model path."""
+    return model_path.replace(
+        "vulnerability_risk_model.pkl",
+        "label_encoder.pkl"
+    )
+
+
+# ── Load model at startup (module import time) ────────────────────────────────
+# Loading here means:
+#   - Memory is allocated ONCE and shared across all requests
+#   - No per-request loading overhead
+#   - Faster response on first scan request
+
+_MODEL_PATH   = _resolve_model_path()
+_ENCODER_PATH = _resolve_encoder_path(_MODEL_PATH)
+
+_pipeline = None
+_encoder  = None
+
+try:
+    if os.path.exists(_MODEL_PATH) and os.path.exists(_ENCODER_PATH):
+        _pipeline = joblib.load(_MODEL_PATH)
+        _encoder  = joblib.load(_ENCODER_PATH)
+        logger.info("ML model loaded at startup from: %s", _MODEL_PATH)
+        logger.info("Label encoder loaded from: %s", _ENCODER_PATH)
     else:
         logger.warning(
-            "Model file not found at '%s'. Using rule-based fallback.",
-            config.MODEL_PATH
+            "Model not found at '%s'. Using rule-based fallback. "
+            "Run model/training/train_model.py to generate it.",
+            _MODEL_PATH
         )
+except Exception as exc:
+    logger.error("Failed to load model at startup: %s", exc)
+    _pipeline = None
+    _encoder  = None
 
-    return _model
 
-
-# Mapping from numeric label → human-readable risk string
-_RISK_LABELS = {0: "Low", 1: "Medium", 2: "High", 3: "Critical"}
-
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def predict_risk(features: Dict[str, Any]) -> str:
     """
@@ -67,56 +107,72 @@ def predict_risk(features: Dict[str, Any]) -> str:
     Args:
         features: Dict produced by utils/feature_extractor.py, e.g.:
             {
-                "url_length": 45,
-                "num_parameters": 2,
-                "num_input_fields": 3,
-                "response_size": 12800,
-                "status_code": 200,
-                "num_special_chars": 5,
-                "has_forms": 1,
-                "has_password_field": 0,
+                "url_length":         45,
+                "num_parameters":      2,
+                "num_input_fields":    3,
+                "response_size":   12800,
+                "status_code":       200,
+                "num_special_chars":   5,
+                "has_forms":           1,
+                "has_password_field":  0,
             }
 
     Returns:
         One of: "Low", "Medium", "High", "Critical"
     """
-    model = _load_model()
-
-    if model is not None:
-        return _predict_with_model(model, features)
+    if _pipeline is not None and _encoder is not None:
+        return _predict_with_model(features)
     else:
         return _rule_based_fallback(features)
 
 
-def _predict_with_model(model, features: Dict[str, Any]) -> str:
-    """Use the trained scikit-learn model to predict risk."""
-    # The model expects a 2-D array; we build a single-row feature vector.
-    # The feature order must match the training data — adjust if needed.
+# ── Private helpers ───────────────────────────────────────────────────────────
+
+def _predict_with_model(features: Dict[str, Any]) -> str:
+    """
+    Use the trained scikit-learn pipeline to predict risk.
+    Calls gc.collect() after prediction to free any temporary memory.
+    """
+    # Build a single-row feature vector in the exact order used during training
     feature_vector = np.array([[
         features.get("url_length",          0),
         features.get("num_parameters",      0),
         features.get("num_input_fields",    0),
         features.get("response_size",       0),
-        features.get("status_code",         200),
+        features.get("status_code",       200),
         features.get("num_special_chars",   0),
         features.get("has_forms",           0),
         features.get("has_password_field",  0),
     ]])
 
     try:
-        prediction: int = int(model.predict(feature_vector)[0])
-        risk = _RISK_LABELS.get(prediction, "Medium")
+        raw_prediction: int = int(_pipeline.predict(feature_vector)[0])
+
+        # Use label encoder to convert numeric label → string
+        try:
+            risk = str(_encoder.inverse_transform([raw_prediction])[0])
+        except Exception:
+            # Fallback label map if encoder fails
+            risk = {0: "Low", 1: "Medium", 2: "High", 3: "Critical"}.get(
+                raw_prediction, "Medium"
+            )
+
         logger.debug("Model predicted risk=%s for features=%s", risk, features)
         return risk
+
     except Exception as exc:
-        logger.error("Model prediction failed: %s. Falling back to heuristic.", exc)
+        logger.error("Model prediction failed: %s — falling back to heuristic.", exc)
         return _rule_based_fallback(features)
+
+    finally:
+        # Free any temporary numpy/sklearn memory immediately
+        gc.collect()
 
 
 def _rule_based_fallback(features: Dict[str, Any]) -> str:
     """
-    Simple heuristic used when no trained model is available.
-    Score-based: accumulate risk points and bucket into a label.
+    Score-based heuristic used when no trained model is available.
+    Accumulates risk points from feature thresholds and buckets into a label.
     """
     score = 0
 

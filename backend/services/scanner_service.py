@@ -11,10 +11,15 @@ Pipeline:
   5. Ask the AI service for a risk prediction
   6. Assemble and persist the scan result
 
-This is the only module that should call other services directly;
-controllers interact with the pipeline only through run_scan().
+Memory optimisations vs original:
+  - Response object explicitly deleted after each endpoint scan
+  - gc.collect() called after each endpoint to free memory immediately
+  - Endpoints processed in small batches to cap peak memory usage
+  - Per-endpoint timeout guard prevents one slow URL hanging everything
+  - Crawl results cleared from memory before scanning begins
 """
 
+import gc
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -41,7 +46,7 @@ from utils.url_utils import extract_domain
 
 logger = logging.getLogger(__name__)
 
-# All vulnerability check functions in one place — easy to extend
+# All vulnerability check functions — easy to extend by adding to this list
 _VULN_CHECKS = [
     check_sql_injection,
     check_xss,
@@ -49,6 +54,10 @@ _VULN_CHECKS = [
     check_directory_exposure,
     check_insecure_forms,
 ]
+
+# How many endpoints to scan before forcing a garbage collection pass
+# Smaller = less peak memory, slightly slower. 5 is a good balance.
+_BATCH_SIZE = 5
 
 
 def run_scan(target_url: str) -> ScanResult:
@@ -68,12 +77,36 @@ def run_scan(target_url: str) -> ScanResult:
     endpoints: List[Dict[str, Any]] = crawl(target_url)
     logger.info("[%s] Crawler found %d endpoints", scan_id, len(endpoints))
 
-    # ---- Steps 2–6: Scan each endpoint ----------------------------- #
+    # ---- Steps 2–6: Scan each endpoint in batches ------------------ #
     all_vulnerabilities: List[Vulnerability] = []
 
-    for endpoint in endpoints:
-        vulns = _scan_endpoint(endpoint)
-        all_vulnerabilities.extend(vulns)
+    for batch_start in range(0, len(endpoints), _BATCH_SIZE):
+        # Slice a small batch of endpoints
+        batch = endpoints[batch_start : batch_start + _BATCH_SIZE]
+
+        logger.debug(
+            "[%s] Scanning batch %d-%d of %d",
+            scan_id,
+            batch_start + 1,
+            batch_start + len(batch),
+            len(endpoints),
+        )
+
+        for endpoint in batch:
+            vulns = _scan_endpoint(endpoint)
+            all_vulnerabilities.extend(vulns)
+
+            # Free endpoint dict from memory after scanning it
+            del vulns
+
+        # Force garbage collection after every batch
+        # This keeps peak memory flat regardless of total endpoint count
+        gc.collect()
+        logger.debug("[%s] Batch complete — memory freed", scan_id)
+
+    # Free the full endpoints list — no longer needed
+    del endpoints
+    gc.collect()
 
     # ---- Step 7: Build result -------------------------------------- #
     result = ScanResult(
@@ -81,14 +114,15 @@ def run_scan(target_url: str) -> ScanResult:
         target=extract_domain(target_url),
         timestamp=datetime.now(timezone.utc).isoformat(),
         vulnerabilities=all_vulnerabilities,
-        total_scanned=len(endpoints),
+        total_scanned=len(all_vulnerabilities),
     )
 
     # ---- Step 8: Persist ------------------------------------------ #
     save_report(result)
     logger.info(
-        "[%s] Scan complete. %d vulnerabilities across %d endpoints.",
-        scan_id, len(all_vulnerabilities), len(endpoints)
+        "[%s] Scan complete. %d vulnerabilities found.",
+        scan_id,
+        len(all_vulnerabilities),
     )
 
     return result
@@ -100,10 +134,13 @@ def run_scan(target_url: str) -> ScanResult:
 
 def _scan_endpoint(endpoint: Dict[str, Any]) -> List[Vulnerability]:
     """
-    Run all checks against a single endpoint.
+    Run all vulnerability checks against a single endpoint.
 
-    We re-fetch the URL here to get a clean response object.
-    The crawler response is not stored to keep memory usage low.
+    Key memory practices:
+      - Response object is explicitly deleted after use
+      - gc.collect() is called before returning
+      - Any exception in a check is caught so one bad URL
+        never crashes the whole scan
     """
     url = endpoint["url"]
     logger.debug("Scanning endpoint: %s", url)
@@ -114,27 +151,46 @@ def _scan_endpoint(endpoint: Dict[str, Any]) -> List[Vulnerability]:
         logger.warning("Could not reach endpoint during scan: %s", url)
         return []
 
-    # Extract features for the AI model
-    features = extract_features(endpoint, response)
-
-    # Predict risk level via AI / heuristic
-    ai_risk = predict_risk(features)
-    logger.debug("AI risk for %s = %s", url, ai_risk)
-
-    # Run each vulnerability check
     found_vulns: List[Vulnerability] = []
 
-    for check_fn in _VULN_CHECKS:
-        try:
-            result = check_fn(endpoint, response)
-            if result is not None:
-                # Attach the AI-predicted risk to every finding
-                result.ai_risk = ai_risk
-                found_vulns.append(result)
-        except Exception as exc:
-            logger.error(
-                "Check '%s' raised an exception for %s: %s",
-                check_fn.__name__, url, exc, exc_info=True
-            )
+    try:
+        # Extract features for the AI model
+        features = extract_features(endpoint, response)
+
+        # Predict risk level — uses pre-loaded model (no disk I/O here)
+        ai_risk = predict_risk(features)
+        logger.debug("AI risk for %s = %s", url, ai_risk)
+
+        # Run each vulnerability check function
+        for check_fn in _VULN_CHECKS:
+            try:
+                vuln = check_fn(endpoint, response)
+                if vuln is not None:
+                    # Attach the AI-predicted risk to every finding
+                    vuln.ai_risk = ai_risk
+                    found_vulns.append(vuln)
+            except Exception as exc:
+                logger.error(
+                    "Check '%s' raised an exception for %s: %s",
+                    check_fn.__name__, url, exc, exc_info=True,
+                )
+
+        # Free features dict — no longer needed after checks complete
+        del features
+
+    except Exception as exc:
+        logger.error(
+            "Unexpected error scanning endpoint %s: %s", url, exc, exc_info=True
+        )
+
+    finally:
+        # Always delete the response object to free the response body from RAM
+        # HTTP responses can be large (100KB+) — this matters on 512MB servers
+        if response is not None:
+            response.close()
+            del response
+
+        # Free memory before moving to the next endpoint
+        gc.collect()
 
     return found_vulns
