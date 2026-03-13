@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Node / React
+node_modules/
+dist/
+.DS_Store
+
+# VS Code
+.vscode/
+
+# Model files (large - optional to exclude)
+# model/saved_models/*.pkl
+
+# Scan reports (generated at runtime)
+backend/data/scan_reports/*.json
