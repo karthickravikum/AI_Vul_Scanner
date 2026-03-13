@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: vuln-scanner-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: MODEL_PATH
+        value: ../model/saved_models/vulnerability_risk_model.pkl
+      - key: FLASK_DEBUG
+        value: false
+      - key: PORT
+        value: 5000

@@ -55,9 +55,7 @@ def create_app() -> Flask:
 # Development server entry point
 # ------------------------------------------------------------------ #
 if __name__ == "__main__":
+    import os
+    port = int(os.environ.get("PORT", 5000))
     flask_app = create_app()
-    flask_app.run(
-        host=config.HOST,
-        port=config.PORT,
-        debug=config.DEBUG
-    )
+    flask_app.run(host="0.0.0.0", port=port, debug=False)
