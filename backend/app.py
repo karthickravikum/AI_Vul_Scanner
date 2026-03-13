@@ -33,7 +33,10 @@ def create_app() -> Flask:
     app.secret_key = config.SECRET_KEY
 
     # Allow requests from any origin (adjust in production to specific domains)
-    CORS(app, resources={r"/api/*": {"origins": "*"}})
+    CORS(app, resources={r"/api/*": {"origins": [
+        "https://ai-vul-scanner.vercel.app",
+        "http://localhost:5173"
+    ]}})
 
     # Configure centralised logging
     setup_logger()
